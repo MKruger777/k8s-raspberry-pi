@@ -2,11 +2,11 @@
 #==============================================================================
 #
 # title           : master-node-install.sh
-# description     : This script aims to provision a k8s master node on a raspberry pi.
+# description     : This script aims to provision a k8s master node on a raspberry pi (v1.36 + Calico v3.29).
 #                 : Included:
 #                 : kubeadm, kubectl and kubelet  (Kubernetes v1.31.)
 #                 : containerD
-#                 : Flannel (pod-network-cidr used "10.244.0.0/16")
+#                 : Calico for Container Network Interface (CNI)  (pod-network-cidr used "10.244.0.0/16")
 # author          : Morné Kruger
 # date            : 10.12.2024
 # version         : 0.1
@@ -22,116 +22,87 @@
 # bash_version    : tested on 5.0.11(1)-release
 #
 #==============================================================================
-
 #!/bin/sh
+set -e 
 
-echo ""
-echo "enable IPv4 packet forwarding..."
-# sysctl params required by setup, params persist across reboots
+echo "--- Turning off swap (Required by K8s) ---"
+sudo swapoff -a
+sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+echo "--- Configuring Kernel Modules ---"
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+br_netfilter
+overlay
+EOF
+
+echo "---  Load kernel modules (modprobe br_netfilter and overlay) into the current session ---"
+sudo modprobe br_netfilter
+sudo modprobe overlay
+
+echo "--- Enable IPv4 packet forwarding ---"
 cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
 net.ipv4.ip_forward = 1
 EOF
 
-echo ""
-echo "Apply sysctl params without reboot..."
 sudo sysctl --system
 
-echo ""
-echo "Verifing that net.ipv4.ip_forward is set to 1. Current value = "
-sysctl net.ipv4.ip_forward
-
+echo "--- Installing Prerequisites ---"
 sudo apt-get update
-# apt-transport-https may be a dummy package; if so, you can skip that package
 sudo apt-get install -y apt-transport-https ca-certificates curl gpg
 
-# If the directory `/etc/apt/keyrings` does not exist, it should be created before the curl command, read the note below.
-# In releases older than Debian 12 and Ubuntu 22.04, directory /etc/apt/keyrings does not exist by default, and it should be created before the curl command.
-# sudo mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "--- Set up the official Kubernetes v1.36 repository ---"
+sudo mkdir -p -m 755 /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.36/deb/Release.key | sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.36/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
 
-# This overwrites any existing configuration in /etc/apt/sources.list.d/kubernetes.list
-echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+echo "--- Installing Container Runtime (containerd) ---"
+sudo apt-get update
+sudo apt-get install -y containerd
 
+echo "--- Configure containerd to use Systemd Cgroup driver ---"
+sudo mkdir -p /etc/containerd
+containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/' | sudo tee /etc/containerd/config.toml
+sudo systemctl restart containerd
+
+echo "--- Installing Kubernetes core binaries (Kubelet, Kubeadm, Kubectl) v1.36 ---"
 sudo apt-get update
 sudo apt-get install -y kubelet kubeadm kubectl
 sudo apt-mark hold kubelet kubeadm kubectl
 
-echo ""
-echo "checking the version of kubeadm ..."
-kubeadm version
-
-echo ""
-echo "starting container runtime install ..."
-
-sudo apt update
-sudo apt install -y containerd
-
-echo ""
-echo "set cgroup drive to use systemd..."
-sudo mkdir -p /etc/containerd
-containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/' | sudo tee /etc/containerd/config.toml
-
-echo ""
-echo "check that the set cgroup drive to use systemd was done correctly ..."
-cat /etc/containerd/config.toml  | grep -i SystemdCgroup -B 50
-
-echo ""
-echo "restarting systemd..."
-sudo systemd restart containerd
-
-echo "   !!!   master node configuration ONLY!"
-echo ""
-echo "init master node..."
-
-echo ""
-echo "Configure the Kernel Module ‘br_netfilter’ in the containerd configuration file..."
-sudo tee /etc/modules-load.d/containerd.conf <<EOF
-br_netfilter
-EOF
-
-echo ""
-echo "Load the br_netfilter modules into the running Linux kernel."
-sudo modprobe br_netfilter
-
-echo "Enable the kubelet service before running kubeadm ..."
+echo "--- Start initializing Master Node ---"
+echo "--- Enable the kubelet service ---"
 sudo systemctl enable --now kubelet
-echo "done"
 
-echo ""
-echo "getting master node ip ..."
-MASTER_NODE_IP=$(hostname -I)
-echo "master node ip set to $MASTER_NODE_IP"
-echo "running kubeadm init ... "
-sudo kubeadm init --apiserver-advertise-address $MASTER_NODE_IP --pod-network-cidr "10.244.0.0/16" --upload-certs
+# Isolate primary node IP address safely
+MASTER_NODE_IP=$(hostname -I | awk '{print $1}')
+echo "Master node IP bound to: $MASTER_NODE_IP"
 
-echo "waiting on kubeconfig file creation @ /etc/kubernetes/admin.conf ..."
-until [ -f /etc/kubernetes/admin.conf ]
-do
-     sleep 5
-done
-echo "kubeconfig file ready to be copied !"
+echo "Define Pod Network CIDR for Calico"
+POD_CIDR="10.244.0.0/16"
+echo "Pod Network CIDR for Calico is set to = $POD_CIDR"
+echo "Initialize Kubernetes Control Plane"
+sudo kubeadm init --apiserver-advertise-address="$MASTER_NODE_IP" --pod-network-cidr="$POD_CIDR" --upload-certs
 
-echo ""
-echo "setup kubeconfig file in correct location to make kubectl work out of the box ... "
-echo '$HOME variable is =  ' $HOME 
+echo "--- Set up local non-root user kubeconfig permissions---"
 mkdir -p $HOME/.kube
 sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
 sudo chown $(id -u):$(id -g) $HOME/.kube/config
 
-echo ""
-echo "testing kubectl with new kubeconfig file ... "
-kubectl get nodes
+echo "Giving the API server a moment (15s) to settle down before making API calls ... "
+sleep 15
 
-echo ""
-echo "Installing a Pod network (flannel) add-on ..."
-kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+echo "--- Deploying  Tigera Operator for Calico CNI Operator (v3.29.1 ARM64 Fix) ---"
+echo "--- # 1. Installing the Tigera operator ---"
+kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/tigera-operator.yaml
 
+echo "---  2. Download the default Calico custom resources manifest ---"
+curl -fsSL -O https://raw.githubusercontent.com/projectcalico/calico/v3.29.1/manifests/custom-resources.yaml
 
-echo ""
-echo "master node provisioning complete. Check output for errors."
-echo "as soon as a minion node(s) are ready to join, it can be done by running the kubeadm join command on each minion node that wishes to join the cluster."
-echo "use command :"
-echo "kubeadm join <master node ip>:6443  --token <token> --discovery-token-ca-cert-hash sha256:<token>"
-echo "ATTENTION - EXAMPLE ONLY!!"
-echo "kubeadm join 192.168.1.101:6443 --token ctig06.yubi6iamfakefviq --discovery-token-ca-cert-hash sha256:1891f0fdd09e3d73094ca12345678910eabec4290f1a7iamfakefb77dfedf412"
-echo "USE THE EXACT STATEMENT THAT WAS GENEREATED DURING YOUR MASTER NODE PROVISIONING!"
+echo "---  3. Dynamically update Calico's default IP pool string to match your cluster POD_CIDR ---"
+sed -i "s|cidr: 192.168.0.0/16|cidr: $POD_CIDR|g" custom-resources.yaml
+
+echo "---  4. Apply the modified configuration to instantiate the Calico pods ---"
+kubectl create -f custom-resources.yaml
+
+echo "Master node setup complete!"
+echo "Watch your Calico pods come up using: kubectl get pods -n calico-system -w"
